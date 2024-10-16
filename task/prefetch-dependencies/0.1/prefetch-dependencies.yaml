@@ -30,6 +30,10 @@ spec:
 
     [available configuration parameters]: https://github.com/containerbuildsystem/cachi2?tab=readme-ov-file#available-configuration-parameters
   params:
+  - name: ACTIVATION_KEY
+    description: Name of secret which contains subscription activation key
+    type: string
+    default: activation-key
   - description: Configures project packages that will have their dependencies prefetched.
     name: input
   - description: >
@@ -74,7 +78,8 @@ spec:
         yq 'del(.goproxy_url)' <<< "${CONFIG_FILE_CONTENT}" > /mnt/config/config.yaml
       fi
 
-  - image: quay.io/redhat-appstudio/cachi2:0.11.0@sha256:1051a8e55f4b6dddb5591ac103644e1d45b2367cffe50ba900418939aace0fb2
+  - # image: quay.io/redhat-appstudio/cachi2:0.11.0@sha256:1051a8e55f4b6dddb5591ac103644e1d45b2367cffe50ba900418939aace0fb2
+    image: quay.io/jkyros/cachi2:latest
     # per https://kubernetes.io/docs/concepts/containers/images/#imagepullpolicy-defaulting
     # the cluster will set imagePullPolicy to IfNotPresent
     name: prefetch-dependencies
@@ -94,6 +99,8 @@ spec:
     - name: WORKSPACE_NETRC_PATH
       value: $(workspaces.netrc.path)
     volumeMounts:
+      - name: activation-key
+        mountPath: /activation-key
       - name: trusted-ca
         mountPath: /mnt/trusted-ca
         readOnly: true
@@ -146,6 +153,29 @@ spec:
         update-ca-trust
       fi
 
+      ACTIVATION_KEY_PATH="/activation-key"
+      if [ -d "$ACTIVATION_KEY_PATH" ]; then
+          echo "Detected activation key, registering with RHSM."
+          # todo: make sure orgid key is consistent with buildah task and docs
+          subscription-manager register \
+            --org $(cat "/activation-key/orgid") \
+            --activationkey $(cat "/activation-key/activationkey")
+          # detect entitlement certs and setup environment variables
+          ls /etc/pki/entitlement/
+          export RHSM_ID=$(ls /etc/pki/entitlement/ | grep key | cut -d - -f 1)
+          echo $RHSM_ID
+          export C2_CLIENT_CERT="/etc/pki/entitlement/$RHSM_ID.pem"
+          export C2_CLIENT_KEY="/etc/pki/entitlement/$RHSM_ID-key.pem"
+          echo "Using client certificate $C2_CLIENT_CERT and key $C2_CLIENT_KEY."
+          mkdir -p /certificates/
+          # TODO(jkyros): The new code looks like it doesn't work like the old code, so this is
+          # coax what we had into the new plumbing that allows these options in this place.
+          # Pipeline consumer will need to specify certs for input options.
+          cp $C2_CLIENT_CERT /certificates/client.crt
+          cp $C2_CLIENT_KEY  /certificates/client.key
+          cp /etc/rhsm/ca/redhat-uep.pem /certificates/CA.crt
+      fi
+
       cachi2 --log-level="$LOG_LEVEL" $config_flag fetch-deps \
       $dev_pacman_flag \
       --source=$(workspaces.source.path)/source \
@@ -159,6 +189,13 @@ spec:
 
       cachi2 --log-level="$LOG_LEVEL" inject-files $(workspaces.source.path)/cachi2/output \
       --for-output-dir=/cachi2/output
+
+      # TODO(jkyros): I think we need to unregister too so we don't keep farming registrations in the database
+      if [ -d "$ACTIVATION_KEY_PATH" ]; then
+          echo "Unregistering from RHSM so we don't make a mess"
+          subscription-manager unregister
+      fi
+
   workspaces:
   - name: source
     description: Workspace with the source code, cachi2 artifacts will be stored on the workspace as well
@@ -175,6 +212,10 @@ spec:
       performing http(s) requests.
     optional: true
   volumes:
+    - name: activation-key
+      secret:
+        optional: true
+        secretName: $(params.ACTIVATION_KEY)
     - name: trusted-ca
       configMap:
         name: $(params.caTrustConfigMapName)
